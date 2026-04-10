@@ -18,6 +18,8 @@ app.post("/slack/events", async (req, res) => {
 
   const event = req.body.event;
 
+  res.sendStatus(200);
+
   // ✅ When someone mentions your bot
   if (event && event.type === "app_mention") {
     console.log("Mention received:", event.text);
@@ -37,8 +39,6 @@ app.post("/slack/events", async (req, res) => {
       }
     );
   }
-
-  res.sendStatus(200);
 });
 
 app.listen(PORT, () => console.log(`Running on ${PORT}`));
