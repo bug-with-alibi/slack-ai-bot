@@ -5,16 +5,34 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const processedEvents = new Set();
 
 app.use(express.json());
 
 app.post("/slack/events", async (req, res) => {
+  // Log event
+  console.log("Event ID:", req.body.event_id);
+
   // ✅ Slack verification
   if (req.body.type === "url_verification") {
     return res.status(200).json({
       challenge: req.body.challenge
     });
   }
+
+  // Temporary way to avoid duplicate events
+  const eventId = req.body.event_id;
+
+  // 🚨 DEDUP CHECK
+  if (processedEvents.has(eventId)) {
+    console.log("Duplicate event ignored:", eventId);
+    return res.sendStatus(200);
+  }
+
+  processedEvents.add(eventId);
+
+  // Prevent memory leak
+  setTimeout(() => processedEvents.delete(eventId), 5 * 60 * 1000);
 
   const event = req.body.event;
 
