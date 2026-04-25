@@ -14,6 +14,10 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const INSTALLATIONS_PATH = path.join(__dirname, "data", "installations.json");
 const processedEvents = new Set();
+const supabaseUrl = process.env.SUPABASE_URL?.replace(/\/$/, "") || null;
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || null;
+const installationStoreBackend =
+  supabaseUrl && supabaseServiceRoleKey ? "supabase" : "file";
 
 const requiredEnvVars = [
   "SLACK_CLIENT_ID",
@@ -65,26 +69,150 @@ function getInstallationKey({ teamId, enterpriseId }) {
   return teamId || enterpriseId || null;
 }
 
-async function saveInstallation(installation) {
-  const key = getInstallationKey(installation);
+function normalizeInstallation(installation) {
+  const workspaceKey = getInstallationKey(installation);
 
-  if (!key) {
+  if (!workspaceKey) {
     throw new Error("Installation is missing both teamId and enterpriseId");
   }
 
-  const installations = await readInstallations();
-  installations[key] = {
+  return {
+    workspaceKey,
     ...installation,
     installedAt: new Date().toISOString()
   };
+}
+
+async function saveInstallationToFile(installation) {
+  const normalized = normalizeInstallation(installation);
+  const installations = await readInstallations();
+  installations[normalized.workspaceKey] = normalized;
   await writeInstallations(installations);
 
-  return installations[key];
+  return installations[normalized.workspaceKey];
+}
+
+async function getInstallationByTeamIdFromFile(teamId) {
+  const installations = await readInstallations();
+  return installations[teamId] || null;
+}
+
+async function countInstallationsInFile() {
+  const installations = await readInstallations();
+  return Object.keys(installations).length;
+}
+
+async function callSupabase(pathname, options = {}) {
+  const response = await fetch(`${supabaseUrl}${pathname}`, {
+    ...options,
+    headers: {
+      apikey: supabaseServiceRoleKey,
+      Authorization: `Bearer ${supabaseServiceRoleKey}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    }
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Supabase request failed (${response.status}): ${body}`);
+  }
+
+  if (response.status === 204) {
+    return null;
+  }
+
+  return response.json();
+}
+
+function mapSupabaseRowToInstallation(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    workspaceKey: row.workspace_key,
+    appId: row.app_id,
+    teamId: row.team_id,
+    teamName: row.team_name,
+    enterpriseId: row.enterprise_id,
+    enterpriseName: row.enterprise_name,
+    botToken: row.bot_token,
+    botUserId: row.bot_user_id,
+    scope: row.scope,
+    authedUserId: row.authed_user_id,
+    installedAt: row.installed_at
+  };
+}
+
+async function saveInstallationToSupabase(installation) {
+  const normalized = normalizeInstallation(installation);
+  const payload = {
+    workspace_key: normalized.workspaceKey,
+    app_id: normalized.appId,
+    team_id: normalized.teamId,
+    team_name: normalized.teamName,
+    enterprise_id: normalized.enterpriseId,
+    enterprise_name: normalized.enterpriseName,
+    bot_token: normalized.botToken,
+    bot_user_id: normalized.botUserId,
+    scope: normalized.scope,
+    authed_user_id: normalized.authedUserId,
+    installed_at: normalized.installedAt
+  };
+
+  const rows = await callSupabase(
+    "/rest/v1/slack_installations?on_conflict=workspace_key&select=*",
+    {
+      method: "POST",
+      headers: {
+        Prefer: "resolution=merge-duplicates,return=representation"
+      },
+      body: JSON.stringify(payload)
+    }
+  );
+
+  return mapSupabaseRowToInstallation(rows?.[0]);
+}
+
+async function getInstallationByTeamIdFromSupabase(teamId) {
+  const rows = await callSupabase(
+    `/rest/v1/slack_installations?team_id=eq.${encodeURIComponent(teamId)}&select=*&limit=1`
+  );
+
+  return mapSupabaseRowToInstallation(rows?.[0]);
+}
+
+async function countInstallationsInSupabase() {
+  const rows = await callSupabase(
+    "/rest/v1/slack_installations?select=workspace_key"
+  );
+
+  return rows.length;
+}
+
+async function saveInstallation(installation) {
+  if (installationStoreBackend === "supabase") {
+    return saveInstallationToSupabase(installation);
+  }
+
+  return saveInstallationToFile(installation);
 }
 
 async function getInstallationByTeamId(teamId) {
-  const installations = await readInstallations();
-  return installations[teamId] || null;
+  if (installationStoreBackend === "supabase") {
+    return getInstallationByTeamIdFromSupabase(teamId);
+  }
+
+  return getInstallationByTeamIdFromFile(teamId);
+}
+
+async function getInstallationCount() {
+  if (installationStoreBackend === "supabase") {
+    return countInstallationsInSupabase();
+  }
+
+  return countInstallationsInFile();
 }
 
 function createStateSignature(payload) {
@@ -214,15 +342,16 @@ async function postSlackMessage(token, channel, text) {
 }
 
 app.get("/", async (_req, res) => {
-  const installations = await readInstallations();
+  const installationCount = await getInstallationCount();
   console.log(
-    `[health] root check ok - installed workspaces: ${Object.keys(installations).length}`
+    `[health] root check ok - installed workspaces: ${installationCount}`
   );
 
   res.status(200).json({
     ok: true,
     service: "slack-ai-bot",
-    installedWorkspaces: Object.keys(installations).length,
+    installedWorkspaces: installationCount,
+    installationStoreBackend,
     installPath: "/slack/install",
     eventsPath: "/slack/events"
   });
@@ -390,7 +519,12 @@ ensureInstallationStore()
       console.log(`Install URL: http://localhost:${PORT}/slack/install`);
       console.log(`OAuth redirect URI: ${process.env.SLACK_REDIRECT_URI || "not set"}`);
       console.log(`Slack scopes: ${slackScopes}`);
-      console.log(`Installation store: ${INSTALLATIONS_PATH}`);
+      console.log(`Installation store backend: ${installationStoreBackend}`);
+      if (installationStoreBackend === "supabase") {
+        console.log(`Supabase URL: ${supabaseUrl}`);
+      } else {
+        console.log(`Installation store file: ${INSTALLATIONS_PATH}`);
+      }
     });
   })
   .catch((error) => {
