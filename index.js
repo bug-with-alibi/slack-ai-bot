@@ -10,6 +10,10 @@ import {
   getLlmProviderName,
   getMissingLlmEnvVars
 } from "./lib/llm/index.js";
+import {
+  createMemoryStore,
+  getMemoryConfig
+} from "./lib/memory/index.js";
 
 dotenv.config();
 
@@ -18,6 +22,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const INSTALLATIONS_PATH = path.join(__dirname, "data", "installations.json");
+const MEMORY_STORE_PATH = path.join(__dirname, "data", "conversation-memory.json");
 const processedEvents = new Set();
 const supabaseUrl = process.env.SUPABASE_URL?.replace(/\/$/, "") || null;
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || null;
@@ -27,6 +32,7 @@ const llmProvider = getLlmProviderName();
 const llmMissingEnvVars = getMissingLlmEnvVars();
 const llmClient =
   llmMissingEnvVars.length === 0 ? createLlmClient({ logger: console }) : null;
+const memoryConfig = getMemoryConfig();
 
 const requiredEnvVars = [
   "SLACK_CLIENT_ID",
@@ -224,6 +230,13 @@ async function getInstallationCount() {
   return countInstallationsInFile();
 }
 
+const memoryStore = createMemoryStore({
+  backend: installationStoreBackend,
+  filePath: MEMORY_STORE_PATH,
+  callSupabase,
+  logger: console
+});
+
 function createStateSignature(payload) {
   return crypto
     .createHmac("sha256", process.env.SLACK_CLIENT_SECRET)
@@ -371,13 +384,26 @@ async function updateSlackMessage(token, channel, ts, text) {
   return response.data;
 }
 
-function buildAssistantPrompt({ text }) {
+function buildAssistantSystemPrompt() {
   return [
     "You are a helpful AI teammate responding in Slack.",
     "Keep answers concise, practical, and easy to scan.",
     "If the request is ambiguous, say what assumption you are making.",
+    "Use the conversation context when it is relevant, but do not claim facts that are not present."
+  ].join("\n");
+}
+
+function buildAssistantPrompt({ text, contextText }) {
+  if (!contextText) {
+    return `Current user message:\n${text}`;
+  }
+
+  return [
+    "Conversation context:",
+    contextText,
     "",
-    `User message: ${text}`
+    "Current user message:",
+    text
   ].join("\n");
 }
 
@@ -417,6 +443,8 @@ app.get("/", async (_req, res) => {
     installationStoreBackend,
     llmProvider,
     llmConfigured: llmMissingEnvVars.length === 0,
+    memoryBackend: memoryStore.backend,
+    memoryConfig,
     installPath: "/slack/install",
     eventsPath: "/slack/events"
   });
@@ -559,6 +587,7 @@ app.post("/slack/events", async (req, res) => {
     }
 
     const promptText = getMentionText(event, installation.botUserId);
+    const threadTs = event.thread_ts || event.ts;
 
     if (!promptText) {
       console.log("[events] mention did not include a prompt");
@@ -569,6 +598,16 @@ app.post("/slack/events", async (req, res) => {
       );
       return;
     }
+
+    await memoryStore.saveMessage({
+      workspaceKey: installation.workspaceKey,
+      channelId: event.channel,
+      threadTs,
+      messageTs: event.ts,
+      role: "user",
+      userId: event.user,
+      text: promptText
+    });
 
     if (!llmClient) {
       console.warn(
@@ -590,15 +629,27 @@ app.post("/slack/events", async (req, res) => {
       event.channel,
       "Thinking...",
       {
-        thread_ts: event.thread_ts || event.ts
+        thread_ts: threadTs
       }
     );
 
+    const memoryContext = await memoryStore.buildContext({
+      workspaceKey: installation.workspaceKey,
+      channelId: event.channel,
+      threadTs,
+      currentMessageTs: event.ts,
+      config: memoryConfig
+    });
+
     console.log(
-      `[events] generating LLM response - provider=${llmProvider} workspace=${installation.teamName || installation.enterpriseName || teamId}`
+      `[events] generating LLM response - provider=${llmProvider} workspace=${installation.teamName || installation.enterpriseName || teamId} contextMessages=${memoryContext.selectedMessages.length}`
     );
     const completion = await llmClient.generateText({
-      prompt: buildAssistantPrompt({ text: promptText })
+      systemPrompt: buildAssistantSystemPrompt(),
+      prompt: buildAssistantPrompt({
+        text: promptText,
+        contextText: memoryContext.contextText
+      })
     });
 
     await updateSlackMessage(
@@ -607,6 +658,15 @@ app.post("/slack/events", async (req, res) => {
       placeholder.ts,
       formatSlackReply(completion.text)
     );
+    await memoryStore.saveMessage({
+      workspaceKey: installation.workspaceKey,
+      channelId: event.channel,
+      threadTs,
+      messageTs: placeholder.ts,
+      role: "assistant",
+      userId: installation.botUserId,
+      text: formatSlackReply(completion.text)
+    });
     console.log(
       `[events] LLM reply sent - provider=${llmProvider} finishReason=${completion.finishReason || "unknown"}`
     );
@@ -630,6 +690,9 @@ app.post("/slack/events", async (req, res) => {
 
 ensureInstallationStore()
   .then(() => {
+    return memoryStore.ensureReady();
+  })
+  .then(() => {
     const missing = getMissingEnvVars();
 
     if (missing.length > 0) {
@@ -645,6 +708,10 @@ ensureInstallationStore()
       console.log(`Slack scopes: ${slackScopes}`);
       console.log(`Installation store backend: ${installationStoreBackend}`);
       console.log(`LLM provider: ${llmProvider}`);
+      console.log(`Memory backend: ${memoryStore.backend}`);
+      console.log(
+        `Memory config: thread=${memoryConfig.maxThreadMessages}, channel=${memoryConfig.maxChannelMessages}, contextChars=${memoryConfig.maxContextChars}, messageChars=${memoryConfig.maxMessageChars}`
+      );
       if (llmMissingEnvVars.length > 0) {
         console.warn(
           `LLM is not fully configured. Missing env vars: ${llmMissingEnvVars.join(", ")}`
@@ -654,6 +721,7 @@ ensureInstallationStore()
         console.log(`Supabase URL: ${supabaseUrl}`);
       } else {
         console.log(`Installation store file: ${INSTALLATIONS_PATH}`);
+        console.log(`Memory store file: ${MEMORY_STORE_PATH}`);
       }
     });
   })
