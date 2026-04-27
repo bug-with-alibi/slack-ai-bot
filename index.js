@@ -5,6 +5,11 @@ import dotenv from "dotenv";
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
+import {
+  createLlmClient,
+  getLlmProviderName,
+  getMissingLlmEnvVars
+} from "./lib/llm/index.js";
 
 dotenv.config();
 
@@ -18,6 +23,10 @@ const supabaseUrl = process.env.SUPABASE_URL?.replace(/\/$/, "") || null;
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || null;
 const installationStoreBackend =
   supabaseUrl && supabaseServiceRoleKey ? "supabase" : "file";
+const llmProvider = getLlmProviderName();
+const llmMissingEnvVars = getMissingLlmEnvVars();
+const llmClient =
+  llmMissingEnvVars.length === 0 ? createLlmClient({ logger: console }) : null;
 
 const requiredEnvVars = [
   "SLACK_CLIENT_ID",
@@ -324,10 +333,10 @@ async function exchangeOAuthCodeForInstallation(code) {
   return response.data;
 }
 
-async function postSlackMessage(token, channel, text) {
+async function postSlackMessage(token, channel, text, options = {}) {
   const response = await axios.post(
     "https://slack.com/api/chat.postMessage",
-    { channel, text },
+    { channel, text, ...options },
     {
       headers: {
         Authorization: `Bearer ${token}`,
@@ -339,6 +348,60 @@ async function postSlackMessage(token, channel, text) {
   if (!response.data.ok) {
     throw new Error(response.data.error || "Failed to post message");
   }
+
+  return response.data;
+}
+
+async function updateSlackMessage(token, channel, ts, text) {
+  const response = await axios.post(
+    "https://slack.com/api/chat.update",
+    { channel, ts, text },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+
+  if (!response.data.ok) {
+    throw new Error(response.data.error || "Failed to update message");
+  }
+
+  return response.data;
+}
+
+function buildAssistantPrompt({ text }) {
+  return [
+    "You are a helpful AI teammate responding in Slack.",
+    "Keep answers concise, practical, and easy to scan.",
+    "If the request is ambiguous, say what assumption you are making.",
+    "",
+    `User message: ${text}`
+  ].join("\n");
+}
+
+function getMentionText(event, botUserId) {
+  if (!event?.text) {
+    return "";
+  }
+
+  const mentionToken = botUserId ? `<@${botUserId}>` : null;
+  return event.text.replace(mentionToken || "", "").trim();
+}
+
+function formatSlackReply(text) {
+  const normalized = (text || "").trim();
+
+  if (!normalized) {
+    return "I could not generate a reply just now.";
+  }
+
+  if (normalized.length <= 3500) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, 3497)}...`;
 }
 
 app.get("/", async (_req, res) => {
@@ -352,6 +415,8 @@ app.get("/", async (_req, res) => {
     service: "slack-ai-bot",
     installedWorkspaces: installationCount,
     installationStoreBackend,
+    llmProvider,
+    llmConfigured: llmMissingEnvVars.length === 0,
     installPath: "/slack/install",
     eventsPath: "/slack/events"
   });
@@ -481,26 +546,85 @@ app.post("/slack/events", async (req, res) => {
     return;
   }
 
+  let installation = null;
+  let placeholder = null;
+
   try {
     console.log(`[events] looking up installation for workspace ${teamId}`);
-    const installation = await getInstallationByTeamId(teamId);
+    installation = await getInstallationByTeamId(teamId);
 
     if (!installation?.botToken) {
       console.warn(`No installation found for workspace ${teamId}`);
       return;
     }
 
+    const promptText = getMentionText(event, installation.botUserId);
+
+    if (!promptText) {
+      console.log("[events] mention did not include a prompt");
+      await postSlackMessage(
+        installation.botToken,
+        event.channel,
+        "Tell me what you want help with after mentioning me."
+      );
+      return;
+    }
+
+    if (!llmClient) {
+      console.warn(
+        `[events] LLM not configured - missing env vars: ${llmMissingEnvVars.join(", ")}`
+      );
+      await postSlackMessage(
+        installation.botToken,
+        event.channel,
+        "I am not configured with a Gemini API key yet."
+      );
+      return;
+    }
+
     console.log(
-      `[events] posting fixed reply - workspace=${installation.teamName || installation.enterpriseName || teamId} channel=${event.channel}`
+      `[events] posting placeholder reply - workspace=${installation.teamName || installation.enterpriseName || teamId} channel=${event.channel}`
     );
-    await postSlackMessage(
+    placeholder = await postSlackMessage(
       installation.botToken,
       event.channel,
-      "Hey 👋 I'm alive! (I can't say anything else for now)"
+      "Thinking...",
+      {
+        thread_ts: event.thread_ts || event.ts
+      }
     );
-    console.log("[events] fixed reply sent successfully");
+
+    console.log(
+      `[events] generating LLM response - provider=${llmProvider} workspace=${installation.teamName || installation.enterpriseName || teamId}`
+    );
+    const completion = await llmClient.generateText({
+      prompt: buildAssistantPrompt({ text: promptText })
+    });
+
+    await updateSlackMessage(
+      installation.botToken,
+      event.channel,
+      placeholder.ts,
+      formatSlackReply(completion.text)
+    );
+    console.log(
+      `[events] LLM reply sent - provider=${llmProvider} finishReason=${completion.finishReason || "unknown"}`
+    );
   } catch (error) {
     console.error("Failed to handle Slack event", error);
+
+    if (installation?.botToken && placeholder?.ts) {
+      try {
+        await updateSlackMessage(
+          installation.botToken,
+          event.channel,
+          placeholder.ts,
+          "I hit an error while talking to Gemini. Please try again."
+        );
+      } catch (updateError) {
+        console.error("Failed to update Slack error message", updateError);
+      }
+    }
   }
 });
 
@@ -520,6 +644,12 @@ ensureInstallationStore()
       console.log(`OAuth redirect URI: ${process.env.SLACK_REDIRECT_URI || "not set"}`);
       console.log(`Slack scopes: ${slackScopes}`);
       console.log(`Installation store backend: ${installationStoreBackend}`);
+      console.log(`LLM provider: ${llmProvider}`);
+      if (llmMissingEnvVars.length > 0) {
+        console.warn(
+          `LLM is not fully configured. Missing env vars: ${llmMissingEnvVars.join(", ")}`
+        );
+      }
       if (installationStoreBackend === "supabase") {
         console.log(`Supabase URL: ${supabaseUrl}`);
       } else {
