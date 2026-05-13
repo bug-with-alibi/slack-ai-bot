@@ -1,48 +1,55 @@
-import crypto from "crypto";
 import express from "express";
-import axios from "axios";
 import dotenv from "dotenv";
-import fs from "fs/promises";
-import path from "path";
 import { fileURLToPath } from "url";
-import {
-  createLlmClient,
-  getLlmProviderName,
-  getMissingLlmEnvVars
-} from "./lib/llm/index.js";
-import {
-  createMemoryStore,
-  getMemoryConfig
-} from "./lib/memory/index.js";
+import path from "path";
+
+import { createConfig } from "./lib/config.js";
+import { createInstallationStore } from "./lib/installations.js";
+import { createMemoryStore } from "./lib/memory/index.js";
+import { registerRoutes } from "./lib/routes.js";
+import { createSlackEventsHandler } from "./lib/slack/events.js";
+import { postSlackMessage, updateSlackMessage } from "./lib/slack/api.js";
+import { verifySlackRequest } from "./lib/slack/oauth.js";
+import { createSupabaseClient } from "./lib/supabase.js";
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
-const PORT = Number(process.env.PORT || 3000);
-const INSTALLATIONS_PATH = path.join(__dirname, "data", "installations.json");
-const MEMORY_STORE_PATH = path.join(__dirname, "data", "conversation-memory.json");
-const processedEvents = new Set();
-const supabaseUrl = process.env.SUPABASE_URL?.replace(/\/$/, "") || null;
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || null;
-const installationStoreBackend =
-  supabaseUrl && supabaseServiceRoleKey ? "supabase" : "file";
-const llmProvider = getLlmProviderName();
-const llmMissingEnvVars = getMissingLlmEnvVars();
-const llmClient =
-  llmMissingEnvVars.length === 0 ? createLlmClient({ logger: console }) : null;
-const memoryConfig = getMemoryConfig();
+const config = createConfig({ baseDir: __dirname, logger: console });
+const supabaseClient = createSupabaseClient({
+  url: config.supabaseUrl,
+  serviceRoleKey: config.supabaseServiceRoleKey
+});
 
-const requiredEnvVars = [
-  "SLACK_CLIENT_ID",
-  "SLACK_CLIENT_SECRET",
-  "SLACK_SIGNING_SECRET",
-  "SLACK_REDIRECT_URI"
-];
+const installationStore = createInstallationStore({
+  backend: config.installationStoreBackend,
+  filePath: config.installationsPath,
+  callSupabase: supabaseClient.call,
+  logger: console
+});
 
-const slackScopes =
-  process.env.SLACK_SCOPES || "app_mentions:read,chat:write";
+const memoryStore = createMemoryStore({
+  backend: config.installationStoreBackend,
+  filePath: config.memoryStorePath,
+  callSupabase: supabaseClient.call,
+  logger: console
+});
+
+const slackEventsHandler = createSlackEventsHandler({
+  logger: console,
+  verifySlackRequest: (req) =>
+    verifySlackRequest(req, process.env.SLACK_SIGNING_SECRET),
+  installationStore,
+  memoryStore,
+  memoryConfig: config.memoryConfig,
+  llmClient: config.llmClient,
+  llmProvider: config.llmProvider,
+  llmMissingEnvVars: config.llmMissingEnvVars,
+  postSlackMessage,
+  updateSlackMessage
+});
 
 app.use(
   express.json({
@@ -52,680 +59,58 @@ app.use(
   })
 );
 
-function getMissingEnvVars() {
-  return requiredEnvVars.filter((name) => !process.env[name]);
-}
-
-async function ensureInstallationStore() {
-  await fs.mkdir(path.dirname(INSTALLATIONS_PATH), { recursive: true });
-
-  try {
-    await fs.access(INSTALLATIONS_PATH);
-  } catch {
-    await fs.writeFile(INSTALLATIONS_PATH, JSON.stringify({}, null, 2));
-  }
-}
-
-async function readInstallations() {
-  await ensureInstallationStore();
-  const raw = await fs.readFile(INSTALLATIONS_PATH, "utf8");
-  return JSON.parse(raw || "{}");
-}
-
-async function writeInstallations(installations) {
-  await ensureInstallationStore();
-  await fs.writeFile(
-    INSTALLATIONS_PATH,
-    JSON.stringify(installations, null, 2)
-  );
-}
-
-function getInstallationKey({ teamId, enterpriseId }) {
-  return teamId || enterpriseId || null;
-}
-
-function normalizeInstallation(installation) {
-  const workspaceKey = getInstallationKey(installation);
-
-  if (!workspaceKey) {
-    throw new Error("Installation is missing both teamId and enterpriseId");
-  }
-
-  return {
-    workspaceKey,
-    ...installation,
-    installedAt: new Date().toISOString()
-  };
-}
-
-async function saveInstallationToFile(installation) {
-  const normalized = normalizeInstallation(installation);
-  const installations = await readInstallations();
-  installations[normalized.workspaceKey] = normalized;
-  await writeInstallations(installations);
-
-  return installations[normalized.workspaceKey];
-}
-
-async function getInstallationByTeamIdFromFile(teamId) {
-  const installations = await readInstallations();
-  return installations[teamId] || null;
-}
-
-async function countInstallationsInFile() {
-  const installations = await readInstallations();
-  return Object.keys(installations).length;
-}
-
-async function callSupabase(pathname, options = {}) {
-  const response = await fetch(`${supabaseUrl}${pathname}`, {
-    ...options,
-    headers: {
-      apikey: supabaseServiceRoleKey,
-      Authorization: `Bearer ${supabaseServiceRoleKey}`,
-      "Content-Type": "application/json",
-      ...(options.headers || {})
-    }
-  });
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Supabase request failed (${response.status}): ${body}`);
-  }
-
-  if (response.status === 204) {
-    return null;
-  }
-
-  return response.json();
-}
-
-function mapSupabaseRowToInstallation(row) {
-  if (!row) {
-    return null;
-  }
-
-  return {
-    workspaceKey: row.workspace_key,
-    appId: row.app_id,
-    teamId: row.team_id,
-    teamName: row.team_name,
-    enterpriseId: row.enterprise_id,
-    enterpriseName: row.enterprise_name,
-    botToken: row.bot_token,
-    botUserId: row.bot_user_id,
-    scope: row.scope,
-    authedUserId: row.authed_user_id,
-    installedAt: row.installed_at
-  };
-}
-
-async function saveInstallationToSupabase(installation) {
-  const normalized = normalizeInstallation(installation);
-  const payload = {
-    workspace_key: normalized.workspaceKey,
-    app_id: normalized.appId,
-    team_id: normalized.teamId,
-    team_name: normalized.teamName,
-    enterprise_id: normalized.enterpriseId,
-    enterprise_name: normalized.enterpriseName,
-    bot_token: normalized.botToken,
-    bot_user_id: normalized.botUserId,
-    scope: normalized.scope,
-    authed_user_id: normalized.authedUserId,
-    installed_at: normalized.installedAt
-  };
-
-  const rows = await callSupabase(
-    "/rest/v1/slack_installations?on_conflict=workspace_key&select=*",
-    {
-      method: "POST",
-      headers: {
-        Prefer: "resolution=merge-duplicates,return=representation"
-      },
-      body: JSON.stringify(payload)
-    }
-  );
-
-  return mapSupabaseRowToInstallation(rows?.[0]);
-}
-
-async function getInstallationByTeamIdFromSupabase(teamId) {
-  const rows = await callSupabase(
-    `/rest/v1/slack_installations?team_id=eq.${encodeURIComponent(teamId)}&select=*&limit=1`
-  );
-
-  return mapSupabaseRowToInstallation(rows?.[0]);
-}
-
-async function countInstallationsInSupabase() {
-  const rows = await callSupabase(
-    "/rest/v1/slack_installations?select=workspace_key"
-  );
-
-  return rows.length;
-}
-
-async function saveInstallation(installation) {
-  if (installationStoreBackend === "supabase") {
-    return saveInstallationToSupabase(installation);
-  }
-
-  return saveInstallationToFile(installation);
-}
-
-async function getInstallationByTeamId(teamId) {
-  if (installationStoreBackend === "supabase") {
-    return getInstallationByTeamIdFromSupabase(teamId);
-  }
-
-  return getInstallationByTeamIdFromFile(teamId);
-}
-
-async function getInstallationCount() {
-  if (installationStoreBackend === "supabase") {
-    return countInstallationsInSupabase();
-  }
-
-  return countInstallationsInFile();
-}
-
-const memoryStore = createMemoryStore({
-  backend: installationStoreBackend,
-  filePath: MEMORY_STORE_PATH,
-  callSupabase,
-  logger: console
+registerRoutes(app, {
+  logger: console,
+  config,
+  installationStore,
+  memoryStore,
+  slackEventsHandler
 });
 
-function createStateSignature(payload) {
-  return crypto
-    .createHmac("sha256", process.env.SLACK_CLIENT_SECRET)
-    .update(payload)
-    .digest("hex");
-}
+async function start() {
+  await installationStore.ensureReady();
+  await memoryStore.ensureReady();
 
-function createSlackOAuthState() {
-  const nonce = crypto.randomBytes(16).toString("hex");
-  const timestamp = Date.now().toString();
-  const payload = `${nonce}.${timestamp}`;
-  const signature = createStateSignature(payload);
-
-  return `${payload}.${signature}`;
-}
-
-function isValidSlackOAuthState(state) {
-  if (!state) {
-    return false;
-  }
-
-  const [nonce, timestamp, signature] = state.split(".");
-
-  if (!nonce || !timestamp || !signature) {
-    return false;
-  }
-
-  const payload = `${nonce}.${timestamp}`;
-  const expectedSignature = createStateSignature(payload);
-  const ageMs = Date.now() - Number(timestamp);
-
-  if (!Number.isFinite(ageMs) || ageMs > 10 * 60 * 1000) {
-    return false;
-  }
-
-  if (signature.length !== expectedSignature.length) {
-    return false;
-  }
-
-  return crypto.timingSafeEqual(
-    Buffer.from(signature, "hex"),
-    Buffer.from(expectedSignature, "hex")
-  );
-}
-
-function buildSlackInstallUrl() {
-  const params = new URLSearchParams({
-    client_id: process.env.SLACK_CLIENT_ID,
-    scope: slackScopes,
-    redirect_uri: process.env.SLACK_REDIRECT_URI,
-    state: createSlackOAuthState()
-  });
-
-  return `https://slack.com/oauth/v2/authorize?${params.toString()}`;
-}
-
-function verifySlackRequest(req) {
-  const timestamp = req.headers["x-slack-request-timestamp"];
-  const signature = req.headers["x-slack-signature"];
-
-  if (!timestamp || !signature || !req.rawBody) {
-    return false;
-  }
-
-  const ageSeconds = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp));
-
-  if (!Number.isFinite(ageSeconds) || ageSeconds > 60 * 5) {
-    return false;
-  }
-
-  const baseString = `v0:${timestamp}:${req.rawBody}`;
-  const expectedSignature = `v0=${crypto
-    .createHmac("sha256", process.env.SLACK_SIGNING_SECRET)
-    .update(baseString)
-    .digest("hex")}`;
-
-  if (String(signature).length !== expectedSignature.length) {
-    return false;
-  }
-
-  return crypto.timingSafeEqual(
-    Buffer.from(String(signature), "utf8"),
-    Buffer.from(expectedSignature, "utf8")
-  );
-}
-
-async function exchangeOAuthCodeForInstallation(code) {
-  const response = await axios.post(
-    "https://slack.com/api/oauth.v2.access",
-    new URLSearchParams({
-      client_id: process.env.SLACK_CLIENT_ID,
-      client_secret: process.env.SLACK_CLIENT_SECRET,
-      code,
-      redirect_uri: process.env.SLACK_REDIRECT_URI
-    }).toString(),
-    {
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded"
-      }
-    }
+  const missingSlackEnvVars = config.requiredSlackEnvVars.filter(
+    (name) => !process.env[name]
   );
 
-  if (!response.data.ok) {
-    throw new Error(response.data.error || "Slack OAuth failed");
+  if (missingSlackEnvVars.length > 0) {
+    console.warn(
+      `Missing environment variables: ${missingSlackEnvVars.join(", ")}. Install flow will not work until they are set.`
+    );
   }
 
-  return response.data;
-}
-
-async function postSlackMessage(token, channel, text, options = {}) {
-  const response = await axios.post(
-    "https://slack.com/api/chat.postMessage",
-    { channel, text, ...options },
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json"
-      }
-    }
-  );
-
-  if (!response.data.ok) {
-    throw new Error(response.data.error || "Failed to post message");
-  }
-
-  return response.data;
-}
-
-async function updateSlackMessage(token, channel, ts, text) {
-  const response = await axios.post(
-    "https://slack.com/api/chat.update",
-    { channel, ts, text },
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json"
-      }
-    }
-  );
-
-  if (!response.data.ok) {
-    throw new Error(response.data.error || "Failed to update message");
-  }
-
-  return response.data;
-}
-
-function buildAssistantSystemPrompt() {
-  return [
-    "You are a helpful AI teammate responding in Slack.",
-    "Keep answers concise, practical, and easy to scan.",
-    "If the request is ambiguous, say what assumption you are making.",
-    "Use the conversation context when it is relevant, but do not claim facts that are not present."
-  ].join("\n");
-}
-
-function buildAssistantPrompt({ text, contextText }) {
-  if (!contextText) {
-    return `Current user message:\n${text}`;
-  }
-
-  return [
-    "Conversation context:",
-    contextText,
-    "",
-    "Current user message:",
-    text
-  ].join("\n");
-}
-
-function getMentionText(event, botUserId) {
-  if (!event?.text) {
-    return "";
-  }
-
-  const mentionToken = botUserId ? `<@${botUserId}>` : null;
-  return event.text.replace(mentionToken || "", "").trim();
-}
-
-function formatSlackReply(text) {
-  const normalized = (text || "").trim();
-
-  if (!normalized) {
-    return "I could not generate a reply just now.";
-  }
-
-  if (normalized.length <= 3500) {
-    return normalized;
-  }
-
-  return `${normalized.slice(0, 3497)}...`;
-}
-
-app.get("/", async (_req, res) => {
-  const installationCount = await getInstallationCount();
-  console.log(
-    `[health] root check ok - installed workspaces: ${installationCount}`
-  );
-
-  res.status(200).json({
-    ok: true,
-    service: "slack-ai-bot",
-    installedWorkspaces: installationCount,
-    installationStoreBackend,
-    llmProvider,
-    llmConfigured: llmMissingEnvVars.length === 0,
-    memoryBackend: memoryStore.backend,
-    memoryConfig,
-    installPath: "/slack/install",
-    eventsPath: "/slack/events"
-  });
-});
-
-app.get("/slack/install", (req, res) => {
-  const missing = getMissingEnvVars();
-  console.log(
-    `[oauth] install requested - redirect=${req.query.redirect !== "false"}`
-  );
-
-  if (missing.length > 0) {
-    console.warn(`[oauth] install blocked - missing env vars: ${missing.join(", ")}`);
-    return res.status(500).json({
-      ok: false,
-      error: "missing_env_vars",
-      missing
-    });
-  }
-
-  if (req.query.redirect === "false") {
-    console.log("[oauth] returning Slack install URL as JSON");
-    return res.status(200).json({
-      ok: true,
-      installUrl: buildSlackInstallUrl()
-    });
-  }
-
-  console.log("[oauth] redirecting user to Slack install page");
-  return res.redirect(buildSlackInstallUrl());
-});
-
-app.get("/slack/oauth/callback", async (req, res) => {
-  const { code, state, error } = req.query;
-  console.log("[oauth] callback received");
-
-  if (error) {
-    console.warn(`[oauth] callback returned error from Slack: ${error}`);
-    return res.status(400).send(`Slack OAuth failed: ${error}`);
-  }
-
-  if (!isValidSlackOAuthState(state)) {
-    console.warn("[oauth] callback rejected - invalid or expired state");
-    return res.status(400).send("Invalid or expired OAuth state.");
-  }
-
-  if (!code || typeof code !== "string") {
-    console.warn("[oauth] callback rejected - missing OAuth code");
-    return res.status(400).send("Missing OAuth code.");
-  }
-
-  try {
-    console.log("[oauth] exchanging OAuth code for installation");
-    const oauthResult = await exchangeOAuthCodeForInstallation(code);
-
-    const installation = await saveInstallation({
-      appId: oauthResult.app_id,
-      teamId: oauthResult.team?.id || null,
-      teamName: oauthResult.team?.name || null,
-      enterpriseId: oauthResult.enterprise?.id || null,
-      enterpriseName: oauthResult.enterprise?.name || null,
-      botToken: oauthResult.access_token,
-      botUserId: oauthResult.bot_user_id || null,
-      scope: oauthResult.scope || slackScopes,
-      authedUserId: oauthResult.authed_user?.id || null
-    });
-
+  app.listen(config.port, () => {
+    console.log(`Running on ${config.port}`);
+    console.log(`Install URL: http://localhost:${config.port}/slack/install`);
     console.log(
-      `[oauth] installation saved - teamId=${installation.teamId || "n/a"} enterpriseId=${installation.enterpriseId || "n/a"} workspace=${installation.teamName || installation.enterpriseName || "unknown"}`
+      `OAuth redirect URI: ${process.env.SLACK_REDIRECT_URI || "not set"}`
+    );
+    console.log(`Slack scopes: ${config.slackScopes}`);
+    console.log(`Installation store backend: ${installationStore.backend}`);
+    console.log(`LLM provider: ${config.llmProvider}`);
+    console.log(`Memory backend: ${memoryStore.backend}`);
+    console.log(
+      `Memory config: thread=${config.memoryConfig.maxThreadMessages}, channel=${config.memoryConfig.maxChannelMessages}, contextChars=${config.memoryConfig.maxContextChars}, messageChars=${config.memoryConfig.maxMessageChars}`
     );
 
-    return res.status(200).send(`
-      <h1>Slack app installed</h1>
-      <p>Workspace: ${installation.teamName || installation.enterpriseName || "unknown"}</p>
-      <p>You can close this tab and mention the app in Slack.</p>
-    `);
-  } catch (error) {
-    console.error("Slack OAuth callback failed", error);
-    return res.status(500).send("Slack OAuth exchange failed.");
-  }
-});
-
-app.post("/slack/events", async (req, res) => {
-  if (!verifySlackRequest(req)) {
-    console.warn("[events] rejected request - invalid Slack signature");
-    return res.status(401).json({ ok: false, error: "invalid_signature" });
-  }
-
-  if (req.body.type === "url_verification") {
-    console.log("[events] responding to Slack URL verification challenge");
-    return res.status(200).json({ challenge: req.body.challenge });
-  }
-
-  const eventId = req.body.event_id;
-  console.log(
-    `[events] received event - type=${req.body.event?.type || "unknown"} eventId=${eventId || "n/a"} teamId=${req.body.team_id || req.body.authorizations?.[0]?.team_id || "n/a"}`
-  );
-
-  if (eventId && processedEvents.has(eventId)) {
-    console.log(`[events] duplicate ignored - eventId=${eventId}`);
-    return res.sendStatus(200);
-  }
-
-  if (eventId) {
-    processedEvents.add(eventId);
-    console.log(`[events] tracking event for dedupe - eventId=${eventId}`);
-    setTimeout(() => processedEvents.delete(eventId), 5 * 60 * 1000);
-  }
-
-  res.sendStatus(200);
-  console.log("[events] acknowledged event to Slack");
-
-  const event = req.body.event;
-
-  if (!event || event.type !== "app_mention") {
-    console.log(`[events] no action for event type=${event?.type || "unknown"}`);
-    return;
-  }
-
-  const teamId =
-    req.body.team_id ||
-    req.body.authorizations?.[0]?.team_id ||
-    req.body.event_context?.team_id;
-
-  if (!teamId) {
-    console.warn("Unable to resolve team for incoming Slack event");
-    return;
-  }
-
-  let installation = null;
-  let placeholder = null;
-
-  try {
-    console.log(`[events] looking up installation for workspace ${teamId}`);
-    installation = await getInstallationByTeamId(teamId);
-
-    if (!installation?.botToken) {
-      console.warn(`No installation found for workspace ${teamId}`);
-      return;
-    }
-
-    const promptText = getMentionText(event, installation.botUserId);
-    const threadTs = event.thread_ts || event.ts;
-
-    if (!promptText) {
-      console.log("[events] mention did not include a prompt");
-      await postSlackMessage(
-        installation.botToken,
-        event.channel,
-        "Tell me what you want help with after mentioning me."
-      );
-      return;
-    }
-
-    await memoryStore.saveMessage({
-      workspaceKey: installation.workspaceKey,
-      channelId: event.channel,
-      threadTs,
-      messageTs: event.ts,
-      role: "user",
-      userId: event.user,
-      text: promptText
-    });
-
-    if (!llmClient) {
+    if (config.llmMissingEnvVars.length > 0) {
       console.warn(
-        `[events] LLM not configured - missing env vars: ${llmMissingEnvVars.join(", ")}`
-      );
-      await postSlackMessage(
-        installation.botToken,
-        event.channel,
-        "I am not configured with a Gemini API key yet."
-      );
-      return;
-    }
-
-    console.log(
-      `[events] posting placeholder reply - workspace=${installation.teamName || installation.enterpriseName || teamId} channel=${event.channel}`
-    );
-    placeholder = await postSlackMessage(
-      installation.botToken,
-      event.channel,
-      "Thinking...",
-      {
-        thread_ts: threadTs
-      }
-    );
-
-    const memoryContext = await memoryStore.buildContext({
-      workspaceKey: installation.workspaceKey,
-      channelId: event.channel,
-      threadTs,
-      currentMessageTs: event.ts,
-      config: memoryConfig
-    });
-
-    console.log(
-      `[events] generating LLM response - provider=${llmProvider} workspace=${installation.teamName || installation.enterpriseName || teamId} contextMessages=${memoryContext.selectedMessages.length}`
-    );
-    const completion = await llmClient.generateText({
-      systemPrompt: buildAssistantSystemPrompt(),
-      prompt: buildAssistantPrompt({
-        text: promptText,
-        contextText: memoryContext.contextText
-      })
-    });
-
-    await updateSlackMessage(
-      installation.botToken,
-      event.channel,
-      placeholder.ts,
-      formatSlackReply(completion.text)
-    );
-    await memoryStore.saveMessage({
-      workspaceKey: installation.workspaceKey,
-      channelId: event.channel,
-      threadTs,
-      messageTs: placeholder.ts,
-      role: "assistant",
-      userId: installation.botUserId,
-      text: formatSlackReply(completion.text)
-    });
-    console.log(
-      `[events] LLM reply sent - provider=${llmProvider} finishReason=${completion.finishReason || "unknown"}`
-    );
-  } catch (error) {
-    console.error("Failed to handle Slack event", error);
-
-    if (installation?.botToken && placeholder?.ts) {
-      try {
-        await updateSlackMessage(
-          installation.botToken,
-          event.channel,
-          placeholder.ts,
-          "I hit an error while talking to Gemini. Please try again."
-        );
-      } catch (updateError) {
-        console.error("Failed to update Slack error message", updateError);
-      }
-    }
-  }
-});
-
-ensureInstallationStore()
-  .then(() => {
-    return memoryStore.ensureReady();
-  })
-  .then(() => {
-    const missing = getMissingEnvVars();
-
-    if (missing.length > 0) {
-      console.warn(
-        `Missing environment variables: ${missing.join(", ")}. Install flow will not work until they are set.`
+        `LLM is not fully configured. Missing env vars: ${config.llmMissingEnvVars.join(", ")}`
       );
     }
 
-    app.listen(PORT, () => {
-      console.log(`Running on ${PORT}`);
-      console.log(`Install URL: http://localhost:${PORT}/slack/install`);
-      console.log(`OAuth redirect URI: ${process.env.SLACK_REDIRECT_URI || "not set"}`);
-      console.log(`Slack scopes: ${slackScopes}`);
-      console.log(`Installation store backend: ${installationStoreBackend}`);
-      console.log(`LLM provider: ${llmProvider}`);
-      console.log(`Memory backend: ${memoryStore.backend}`);
-      console.log(
-        `Memory config: thread=${memoryConfig.maxThreadMessages}, channel=${memoryConfig.maxChannelMessages}, contextChars=${memoryConfig.maxContextChars}, messageChars=${memoryConfig.maxMessageChars}`
-      );
-      if (llmMissingEnvVars.length > 0) {
-        console.warn(
-          `LLM is not fully configured. Missing env vars: ${llmMissingEnvVars.join(", ")}`
-        );
-      }
-      if (installationStoreBackend === "supabase") {
-        console.log(`Supabase URL: ${supabaseUrl}`);
-      } else {
-        console.log(`Installation store file: ${INSTALLATIONS_PATH}`);
-        console.log(`Memory store file: ${MEMORY_STORE_PATH}`);
-      }
-    });
-  })
-  .catch((error) => {
-    console.error("Failed to start app", error);
-    process.exit(1);
+    if (installationStore.backend === "supabase") {
+      console.log(`Supabase URL: ${config.supabaseUrl}`);
+    } else {
+      console.log(`Installation store file: ${config.installationsPath}`);
+      console.log(`Memory store file: ${config.memoryStorePath}`);
+    }
   });
+}
+
+start().catch((error) => {
+  console.error("Failed to start app", error);
+  process.exit(1);
+});
