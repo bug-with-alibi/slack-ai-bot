@@ -1,7 +1,5 @@
 import express from "express";
 import dotenv from "dotenv";
-import { fileURLToPath } from "url";
-import path from "path";
 
 import { createConfig } from "./lib/config.js";
 import { createInstallationStore } from "./lib/installations.js";
@@ -14,25 +12,19 @@ import { createSupabaseClient } from "./lib/supabase.js";
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 const app = express();
-const config = createConfig({ baseDir: __dirname, logger: console });
+const config = createConfig({ baseDir: process.cwd(), logger: console });
 const supabaseClient = createSupabaseClient({
   url: config.supabaseUrl,
   serviceRoleKey: config.supabaseServiceRoleKey
 });
 
 const installationStore = createInstallationStore({
-  backend: config.installationStoreBackend,
-  filePath: config.installationsPath,
   callSupabase: supabaseClient.call,
   logger: console
 });
 
 const memoryStore = createMemoryStore({
-  backend: config.installationStoreBackend,
-  filePath: config.memoryStorePath,
   callSupabase: supabaseClient.call,
   logger: console
 });
@@ -68,6 +60,16 @@ registerRoutes(app, {
 });
 
 async function start() {
+  const missingSupabaseEnvVars = config.requiredSupabaseEnvVars.filter(
+    (name) => !process.env[name]
+  );
+
+  if (missingSupabaseEnvVars.length > 0) {
+    throw new Error(
+      `Missing required Supabase environment variables: ${missingSupabaseEnvVars.join(", ")}`
+    );
+  }
+
   await installationStore.ensureReady();
   await memoryStore.ensureReady();
 
@@ -88,9 +90,8 @@ async function start() {
       `OAuth redirect URI: ${process.env.SLACK_REDIRECT_URI || "not set"}`
     );
     console.log(`Slack scopes: ${config.slackScopes}`);
-    console.log(`Installation store backend: ${installationStore.backend}`);
     console.log(`LLM provider: ${config.llmProvider}`);
-    console.log(`Memory backend: ${memoryStore.backend}`);
+    console.log("Storage backend: supabase");
     console.log(
       `Memory config: thread=${config.memoryConfig.maxThreadMessages}, channel=${config.memoryConfig.maxChannelMessages}, contextChars=${config.memoryConfig.maxContextChars}, messageChars=${config.memoryConfig.maxMessageChars}`
     );
@@ -101,12 +102,7 @@ async function start() {
       );
     }
 
-    if (installationStore.backend === "supabase") {
-      console.log(`Supabase URL: ${config.supabaseUrl}`);
-    } else {
-      console.log(`Installation store file: ${config.installationsPath}`);
-      console.log(`Memory store file: ${config.memoryStorePath}`);
-    }
+    console.log(`Supabase URL: ${config.supabaseUrl}`);
   });
 }
 
